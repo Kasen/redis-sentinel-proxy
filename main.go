@@ -81,7 +81,9 @@ func master() {
 			}(saddr)
 			select {
 			case result := <-result_channel:
-				masterAddr = result
+				if result != nil {
+					masterAddr = result
+				}
 			case <-time.After(time.Second * 2):
 				log.Println("Sentinel timed out")
 			}
@@ -119,7 +121,7 @@ func getMasterAddr(sentinelAddress *net.TCPAddr, masterName string) (*net.TCPAdd
 	b := make([]byte, 256)
 	_, err = conn.Read(b)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 
 	parts := strings.Split(string(b), "\r\n")

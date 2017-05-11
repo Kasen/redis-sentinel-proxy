@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,7 +13,7 @@ import (
 
 var (
 	masterAddr *net.TCPAddr
-	saddrs     []*net.TCPAddr
+	sentinels  []string
 
 	localAddr     = flag.String("listen", ":9999", "local address")
 	sentinelAddrs = flag.String("sentinel", ":26379", "List of remote address, separated by coma")
@@ -36,18 +35,11 @@ func main() {
 		f.Close()
 	}
 
-	sentinels := strings.Split(*sentinelAddrs, ",")
+	sentinels = strings.Split(*sentinelAddrs, ",")
 
 	laddr, err := net.ResolveTCPAddr("tcp", *localAddr)
 	if err != nil {
-		log.Fatal("Failed to resolve local address: %s", err)
-	}
-	for _, sentinel := range sentinels {
-		saddr, err := net.ResolveTCPAddr("tcp", sentinel)
-		if err != nil {
-			log.Fatal("Failed to resolve sentinel address: %s", err)
-		}
-		saddrs = append(saddrs, saddr)
+		log.Fatalf("Failed to resolve local address: %s", err)
 	}
 
 	go master()
@@ -69,26 +61,19 @@ func main() {
 }
 
 func master() {
+	resultChannel := make(chan *net.TCPAddr, 1)
+	for _, sentinel := range sentinels {
+		go getMasterAddr(sentinel, *masterName, resultChannel)
+	}
 	for {
-		for _, saddr := range saddrs {
-			result_channel := make(chan *net.TCPAddr, 1)
-			go func(saddr *net.TCPAddr) {
-				master, err := getMasterAddr(saddr, *masterName)
-				if err != nil {
-					log.Println(err)
-				}
-				result_channel <- master
-			}(saddr)
-			select {
-			case result := <-result_channel:
-				if result != nil {
-					masterAddr = result
-				}
-			case <-time.After(time.Second * 2):
-				log.Println("Sentinel timed out")
+		select {
+		case result := <-resultChannel:
+			if result != nil {
+				masterAddr = result
 			}
+		case <-time.After(time.Second * 2):
+			log.Println("All sentinels timed out.")
 		}
-		time.Sleep(1 * time.Second)
 	}
 }
 
@@ -108,42 +93,47 @@ func proxy(local io.ReadWriteCloser, remoteAddr *net.TCPAddr) {
 	go pipe(remote, local)
 }
 
-func getMasterAddr(sentinelAddress *net.TCPAddr, masterName string) (*net.TCPAddr, error) {
-	conn, err := net.DialTCP("tcp", nil, sentinelAddress)
-	if err != nil {
-		return nil, err
+func getMasterAddr(sentinelAddress string, masterName string, resultChannel chan *net.TCPAddr) {
+	for {
+		conn, err := net.DialTimeout("tcp", sentinelAddress, 2*time.Second)
+		if err != nil {
+			log.Println(err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		defer conn.Close()
+		for {
+			conn.Write([]byte(fmt.Sprintf("sentinel get-master-addr-by-name %s\n", masterName)))
+
+			b := make([]byte, 256)
+			_, err = conn.Read(b)
+			if err != nil {
+				log.Println(err)
+				time.Sleep(2 * time.Second)
+				break
+			}
+
+			parts := strings.Split(string(b), "\r\n")
+
+			if len(parts) < 5 {
+				err = fmt.Errorf("Couldn't get master address from sentinel: %s", string(b))
+				log.Println(err)
+				time.Sleep(2 * time.Second)
+				break
+			}
+
+			//getting the string address for the master node
+			stringaddr := fmt.Sprintf("%s:%s", parts[2], parts[4])
+			addr, err := net.ResolveTCPAddr("tcp", stringaddr)
+			if err != nil {
+				log.Println(err)
+				time.Sleep(2 * time.Second)
+				break
+			}
+
+			resultChannel <- addr
+			time.Sleep(time.Second)
+		}
 	}
-
-	defer conn.Close()
-
-	conn.Write([]byte(fmt.Sprintf("sentinel get-master-addr-by-name %s\n", masterName)))
-
-	b := make([]byte, 256)
-	_, err = conn.Read(b)
-	if err != nil {
-		return nil, err
-	}
-
-	parts := strings.Split(string(b), "\r\n")
-
-	if len(parts) < 5 {
-		err = errors.New("Couldn't get master address from sentinel")
-		return nil, err
-	}
-
-	//getting the string address for the master node
-	stringaddr := fmt.Sprintf("%s:%s", parts[2], parts[4])
-	addr, err := net.ResolveTCPAddr("tcp", stringaddr)
-
-	if err != nil {
-		return nil, err
-	}
-
-	//check that there's actually someone listening on that address
-	conn2, err := net.DialTCP("tcp", nil, addr)
-	if err == nil {
-		defer conn2.Close()
-	}
-
-	return addr, err
 }
